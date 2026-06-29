@@ -165,8 +165,10 @@ def inject_canary(urls):
                 try:
                     resp = client.get(test_url)
                     if CANARY in resp.text:
-                        # Determine context
                         context = get_context(resp.text, CANARY)
+                        # Skip Next.js RSC routing echoes — not DOM reflections
+                        if context == "nextjs_rsc":
+                            continue
                         log("good", f"Reflected [{context}] → {param} in {url}")
                         reflected.append({
                             "url": url, "param": param,
@@ -186,8 +188,13 @@ def get_context(html, canary):
         return "unknown"
     surrounding = html[max(0, idx-100):idx+100]
 
-    # Check if inside a script tag
+    # Next.js RSC false positive — canary inside __next_f.push() routing data
+    # These are never executable; Next.js serialises URL params into script data blocks
     pre = html[:idx]
+    if "__next_f" in pre[max(0, len(pre)-300):] or "self.__next_f" in pre[max(0, len(pre)-300):]:
+        return "nextjs_rsc"
+
+    # Check if inside a script tag
     script_opens  = pre.count("<script")
     script_closes = pre.count("</script")
     if script_opens > script_closes:
@@ -367,19 +374,22 @@ def fuzz_with_dalfox(target, waf, oob=None, reflected=None):
         pass
 
     for line in out.splitlines():
-        if "[V]" in line or "VULN" in line.upper() or "XSS" in line:
+        # [V] = dalfox verified execution in real browser context — only real confirmed XSS
+        if "[V]" in line:
             log("crit", f"XSS Confirmed: {line.strip()}")
             xss_findings.append({
                 "type": "xss_confirmed",
                 "detail": line.strip(),
                 "severity": "HIGH"
             })
-        elif "[POC]" in line or "poc" in line.lower():
-            log("warn", f"XSS PoC: {line.strip()}")
+        # [POC] = parameter reflected payload but execution not browser-verified
+        # Logged for awareness but NOT counted as confirmed — requires manual verification
+        elif "[POC]" in line:
+            log("info", f"XSS PoC (needs manual verify): {line.strip()}")
             xss_findings.append({
-                "type": "xss_poc",
+                "type": "xss_poc_unverified",
                 "detail": line.strip(),
-                "severity": "HIGH"
+                "severity": "MEDIUM"
             })
 
     log("good", f"Dalfox complete — {len(xss_findings)} XSS findings")
@@ -542,8 +552,11 @@ def main():
     elapsed = round(time.time() - start, 1)
     log("good", f"Scan complete in {elapsed}s")
     print()
+    confirmed   = [f for f in xss_findings if f["type"] == "xss_confirmed"]
+    unverified  = [f for f in xss_findings if f["type"] == "xss_poc_unverified"]
     print(f"{BO}{'='*60}{RE}")
-    print(f"  {R}XSS Confirmed:  {len(xss_findings)}{RE}")
+    print(f"  {R}XSS Confirmed:  {len(confirmed)} (browser-verified){RE}")
+    print(f"  {Y}XSS PoC:        {len(unverified)} (needs manual verify){RE}")
     print(f"  {Y}Reflection pts: {len(reflected)}{RE}")
     print(f"  {Y}DOM Sinks:      {len([f for f in js_findings if f['type']=='dom_sink'])}{RE}")
     print(f"  {B}WAF:            {waf.upper()}{RE}")
