@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -22,6 +23,7 @@ import urllib.parse
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 from bs4 import BeautifulSoup
@@ -49,7 +51,7 @@ BANNER = f"""
 {Y}  For authorized bug bounty testing only{RE}
 """
 
-CANARY    = "xsscan7r4ck"
+CANARY    = "xss" + uuid4().hex[:8]
 GOPATH    = subprocess.getoutput("go env GOPATH").strip()
 GOBIN     = os.path.join(GOPATH, "bin")
 
@@ -100,7 +102,7 @@ def run(cmd, timeout=120):
 # ── Stage 1: WAF Detection ────────────────────────────────────────────────────
 def detect_waf(target):
     log("info", f"Detecting WAF on {target}...")
-    out, _ = run(f"wafw00f {target} -a 2>&1")
+    out, _ = run(f"wafw00f {shlex.quote(target)} -a 2>&1")
     waf = "generic"
     for line in out.splitlines():
         low = line.lower()
@@ -121,7 +123,7 @@ def detect_waf(target):
 def crawl(target, depth=3):
     log("info", f"Crawling {target} (depth={depth})...")
     out, code = run(
-        f"katana -u {target} -d {depth} -jc -kf all -silent -o /tmp/xss_urls.txt 2>&1",
+        f"katana -u {shlex.quote(target)} -d {depth} -jc -kf all -silent -o /tmp/xss_urls.txt 2>&1",
         timeout=180
     )
     urls = []
@@ -346,7 +348,7 @@ def fuzz_with_dalfox(target, waf, oob=None, reflected=None):
     # Build dalfox command
     oob_flag = f"--blind {oob}" if oob else ""
     dalfox_base = (
-        f"dalfox url {target} "
+        f"dalfox url {shlex.quote(target)} "
         f"--custom-payload {custom_payload_file} "
         f"--skip-bav "
         f"--silence "
@@ -364,7 +366,7 @@ def fuzz_with_dalfox(target, waf, oob=None, reflected=None):
             param_url = r["test_url"]
             log("info", f"Fuzzing reflected param: {r['param']}")
             cmd = (
-                f"dalfox url \"{param_url}\" "
+                f"dalfox url {shlex.quote(param_url)} "
                 f"--custom-payload {custom_payload_file} "
                 f"--skip-bav --silence "
                 f"{oob_flag} "
@@ -481,7 +483,7 @@ def check_firebase(js_findings):
         # Test 2 — Firestore unauthenticated write
         try:
             fs_write_url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/bb_test"
-            payload = {"fields": {"bb_probe": {"stringValue": "xsscan7r4ck_bb_test"}}}
+            payload = {"fields": {"bb_probe": {"stringValue": f"{CANARY}_bb_test"}}}
             r = client.post(fs_write_url, params={"key": api_key}, json=payload)
             if r.status_code in (200, 201):
                 log("crit", f"Firestore OPEN WRITE — unauthenticated document creation confirmed")
@@ -549,7 +551,7 @@ def check_firebase(js_findings):
                 upload_url = f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o"
                 r = client.post(
                     upload_url,
-                    params={"key": api_key, "name": "bb_test/xsscan7r4ck.txt", "uploadType": "media"},
+                    params={"key": api_key, "name": f"bb_test/{CANARY}.txt", "uploadType": "media"},
                     headers={"Content-Type": "text/plain"},
                     content=b"bug bounty probe - authorized test"
                 )
@@ -1062,7 +1064,7 @@ def run_nuclei(target, deep=False):
         templates += ",cves/,vulnerabilities/"
 
     cmd = (
-        f"nuclei -u {target} "
+        f"nuclei -u {shlex.quote(target)} "
         f"-t {templates} "
         f"-severity critical,high,medium "
         f"-silent -jsonl "
