@@ -18,9 +18,11 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -145,39 +147,83 @@ def crawl(target, depth=3):
 
 # ── Stage 3: Canary Injection ─────────────────────────────────────────────────
 def inject_canary(urls):
-    log("info", f"Injecting canary ({CANARY}) into {len(urls)} URLs...")
+    log("info", f"Injecting canary ({CANARY}) into {len(urls)} URLs (GET + POST forms)...")
     reflected = []
+    lock = threading.Lock()
 
     with httpx.Client(timeout=10, follow_redirects=True,
                       verify=False, headers={"User-Agent": "Mozilla/5.0"}) as client:
+
+        def probe_get(url, param, params, parsed):
+            test_params = {k: (CANARY if k == param else v[0]) for k, v in params.items()}
+            test_url = parsed._replace(query=urllib.parse.urlencode(test_params)).geturl()
+            try:
+                resp = client.get(test_url)
+                if CANARY in resp.text:
+                    context = get_context(resp.text, CANARY)
+                    if context == "nextjs_rsc":
+                        return
+                    log("good", f"Reflected GET [{context}] → {param} in {url}")
+                    with lock:
+                        reflected.append({"url": url, "param": param,
+                                          "context": context, "test_url": test_url,
+                                          "method": "GET"})
+            except Exception:
+                pass
+
+        def probe_post_forms(url):
+            parsed = urllib.parse.urlparse(url)
+            base = f"{parsed.scheme}://{parsed.netloc}"
+            try:
+                resp = client.get(url)
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for form in soup.find_all("form", method=re.compile(r"^post$", re.I)):
+                    action = form.get("action") or url
+                    if not action.startswith("http"):
+                        action = (base + action) if action.startswith("/") else url
+                    inputs = {
+                        inp["name"]: inp.get("value", "test")
+                        for inp in form.find_all(["input", "textarea"])
+                        if inp.get("name") and inp.get("type", "").lower()
+                        not in ("submit", "button", "image", "reset", "file")
+                    }
+                    if not inputs:
+                        continue
+                    for field in list(inputs):
+                        data = {k: (CANARY if k == field else v) for k, v in inputs.items()}
+                        try:
+                            r = client.post(action, data=data)
+                            if CANARY in r.text:
+                                context = get_context(r.text, CANARY)
+                                if context == "nextjs_rsc":
+                                    continue
+                                log("good", f"Reflected POST [{context}] → {field} at {action}")
+                                with lock:
+                                    reflected.append({"url": url, "param": field,
+                                                      "context": context, "test_url": action,
+                                                      "method": "POST"})
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # Build GET tasks from URLs that have query params
+        get_tasks = []
         for url in urls:
             parsed = urllib.parse.urlparse(url)
             params = urllib.parse.parse_qs(parsed.query)
-            if not params:
-                continue
-
-            # Inject canary into each param
             for param in params:
-                test_params = {k: (CANARY if k == param else v[0])
-                               for k, v in params.items()}
-                test_url = parsed._replace(
-                    query=urllib.parse.urlencode(test_params)
-                ).geturl()
+                get_tasks.append((url, param, params, parsed))
 
+        with ThreadPoolExecutor(max_workers=15) as executor:
+            futures = [executor.submit(probe_get, url, param, params, parsed)
+                       for url, param, params, parsed in get_tasks]
+            futures += [executor.submit(probe_post_forms, url) for url in urls]
+            for future in as_completed(futures):
                 try:
-                    resp = client.get(test_url)
-                    if CANARY in resp.text:
-                        context = get_context(resp.text, CANARY)
-                        # Skip Next.js RSC routing echoes — not DOM reflections
-                        if context == "nextjs_rsc":
-                            continue
-                        log("good", f"Reflected [{context}] → {param} in {url}")
-                        reflected.append({
-                            "url": url, "param": param,
-                            "context": context, "test_url": test_url
-                        })
+                    future.result()
                 except Exception:
-                    continue
+                    pass
 
     log("good", f"Found {len(reflected)} reflection points")
     return reflected
@@ -360,9 +406,10 @@ def fuzz_with_dalfox(target, waf, oob=None, reflected=None):
     log("info", f"Fuzzing target: {target}")
     out, _ = run(dalfox_base, timeout=300)
 
-    # Also fuzz reflected params individually
+    # Also fuzz GET-reflected params individually (dalfox is a GET fuzzer)
     if reflected:
-        for r in reflected[:10]:  # cap at 10 reflected params
+        get_reflected = [r for r in reflected if r.get("method", "GET") == "GET"]
+        for r in get_reflected[:10]:  # cap at 10
             param_url = r["test_url"]
             log("info", f"Fuzzing reflected param: {r['param']}")
             cmd = (
@@ -699,9 +746,36 @@ def check_open_redirect(urls):
         "u", "r", "location", "out", "jump", "to", "from",
     }
 
+    # Top redirect params to use in synthetic probing (smaller set to control volume)
+    TOP_REDIRECT_PARAMS = [
+        "redirect", "url", "next", "return", "goto", "destination", "redirect_uri", "return_url",
+    ]
+
     tested = set()
     with httpx.Client(timeout=8, verify=False, follow_redirects=False,
                       headers={"User-Agent": "Mozilla/5.0"}) as client:
+
+        def _check(test_url, url, param):
+            if test_url in tested:
+                return
+            tested.add(test_url)
+            try:
+                r = client.get(test_url)
+                location = r.headers.get("location", "")
+                if r.status_code in (301, 302, 303, 307, 308) and "evil.com" in location:
+                    log("crit", f"Open redirect — param '{param}' redirects to evil.com at {url}")
+                    redirect_findings.append({
+                        "type":     "open_redirect",
+                        "severity": "HIGH",
+                        "url":      url,
+                        "param":    param,
+                        "test_url": test_url,
+                        "detail":   f"Param '{param}' causes redirect to {location}",
+                    })
+            except Exception:
+                pass
+
+        # Pass 1 — test redirect params already present in crawled URLs
         for url in urls:
             parsed = urllib.parse.urlparse(url)
             params = urllib.parse.parse_qs(parsed.query)
@@ -710,24 +784,21 @@ def check_open_redirect(urls):
                     continue
                 test_params = {k: (evil_url if k == param else v[0]) for k, v in params.items()}
                 test_url = parsed._replace(query=urllib.parse.urlencode(test_params)).geturl()
-                if test_url in tested:
-                    continue
-                tested.add(test_url)
-                try:
-                    r = client.get(test_url)
-                    location = r.headers.get("location", "")
-                    if r.status_code in (301, 302, 303, 307, 308) and "evil.com" in location:
-                        log("crit", f"Open redirect — param '{param}' redirects to evil.com at {url}")
-                        redirect_findings.append({
-                            "type":     "open_redirect",
-                            "severity": "HIGH",
-                            "url":      url,
-                            "param":    param,
-                            "test_url": test_url,
-                            "detail":   f"Param '{param}' causes redirect to {location}",
-                        })
-                except Exception:
-                    continue
+                _check(test_url, url, param)
+
+        # Pass 2 — synthetic: inject top redirect params into unique base paths
+        seen_paths = set()
+        for url in urls:
+            parsed = urllib.parse.urlparse(url)
+            path_key = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            if len(seen_paths) > 30:
+                break
+            for rp in TOP_REDIRECT_PARAMS:
+                test_url = f"{path_key}?{rp}={urllib.parse.quote(evil_url, safe='')}"
+                _check(test_url, path_key, rp)
 
     log("good", f"Redirect check complete — {len(redirect_findings)} open redirects found")
     return redirect_findings
@@ -895,6 +966,28 @@ def check_jsonp(urls):
     tested = set()
     with httpx.Client(timeout=8, verify=False, follow_redirects=True,
                       headers={"User-Agent": "Mozilla/5.0"}) as client:
+
+        def _check(test_url, url, param):
+            if test_url in tested:
+                return
+            tested.add(test_url)
+            try:
+                r = client.get(test_url)
+                if probe + "(" in r.text:
+                    log("crit", f"JSONP endpoint — '{param}' reflects unquoted at {url}")
+                    jsonp_findings.append({
+                        "type":     "jsonp_endpoint",
+                        "severity": "HIGH",
+                        "url":      url,
+                        "param":    param,
+                        "test_url": test_url,
+                        "detail":   f"Callback param '{param}' reflected as bare function call — JSONP XSS possible",
+                        "evidence": r.text[:200],
+                    })
+            except Exception:
+                pass
+
+        # Pass 1 — test callback params already present in crawled URLs
         for url in urls:
             parsed = urllib.parse.urlparse(url)
             params = urllib.parse.parse_qs(parsed.query)
@@ -903,24 +996,21 @@ def check_jsonp(urls):
                     continue
                 test_params = {k: (probe if k == param else v[0]) for k, v in params.items()}
                 test_url = parsed._replace(query=urllib.parse.urlencode(test_params)).geturl()
-                if test_url in tested:
-                    continue
-                tested.add(test_url)
-                try:
-                    r = client.get(test_url)
-                    if probe + "(" in r.text:
-                        log("crit", f"JSONP endpoint — '{param}' reflects unquoted at {url}")
-                        jsonp_findings.append({
-                            "type":     "jsonp_endpoint",
-                            "severity": "HIGH",
-                            "url":      url,
-                            "param":    param,
-                            "test_url": test_url,
-                            "detail":   f"Callback param '{param}' reflected as bare function call — JSONP XSS possible",
-                            "evidence": r.text[:200],
-                        })
-                except Exception:
-                    continue
+                _check(test_url, url, param)
+
+        # Pass 2 — synthetic: inject all callback params into unique base paths
+        seen_paths = set()
+        for url in urls:
+            parsed = urllib.parse.urlparse(url)
+            path_key = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            if len(seen_paths) > 20:
+                break
+            for cb_param in CALLBACK_PARAMS:
+                test_url = f"{path_key}?{cb_param}={probe}"
+                _check(test_url, path_key, cb_param)
 
     log("good", f"JSONP check complete — {len(jsonp_findings)} endpoints found")
     return jsonp_findings
@@ -1164,10 +1254,11 @@ def generate_report(target, waf, reflected, js_findings, xss_findings, firebase_
 
     lines += ["", "---", "", "## 2. Reflection Points", ""]
     if reflected:
-        lines.append("| Parameter | URL | Context |")
-        lines.append("|---|---|---|")
+        lines.append("| Method | Parameter | URL | Context |")
+        lines.append("|---|---|---|---|")
         for r in reflected:
-            lines.append(f"| `{r['param']}` | `{r['url'][:80]}` | {r['context']} |")
+            method = r.get("method", "GET")
+            lines.append(f"| {method} | `{r['param']}` | `{r['url'][:80]}` | {r['context']} |")
     else:
         lines.append("No reflection points found.")
 
