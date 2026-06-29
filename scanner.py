@@ -986,10 +986,132 @@ def check_graphql(target):
     return gql_findings
 
 
+# ── Stage 15: Clickjacking Detection ─────────────────────────────────────────
+def check_clickjacking(target):
+    log("info", "Checking clickjacking protection...")
+    cj_findings = []
+
+    with httpx.Client(timeout=10, verify=False, follow_redirects=True) as client:
+        try:
+            r = client.get(target, headers={"User-Agent": "Mozilla/5.0"})
+        except Exception as e:
+            log("bad", f"Clickjacking check failed: {e}")
+            return cj_findings
+
+        xfo = r.headers.get("x-frame-options", "").upper()
+        csp = r.headers.get("content-security-policy", "")
+
+        # CSP frame-ancestors takes precedence over XFO in modern browsers
+        fa_match = re.search(r'frame-ancestors\s+([^;]+)', csp, re.IGNORECASE)
+        frame_ancestors = fa_match.group(1).strip() if fa_match else ""
+
+        xfo_safe = xfo in ("DENY", "SAMEORIGIN")
+        fa_safe   = bool(frame_ancestors) and "*" not in frame_ancestors
+
+        if not xfo_safe and not frame_ancestors:
+            log("crit", "Clickjacking HIGH — no X-Frame-Options and no CSP frame-ancestors")
+            cj_findings.append({
+                "type":            "clickjacking_no_protection",
+                "severity":        "HIGH",
+                "detail":          "Page can be embedded in an iframe from any origin",
+                "xfo":             xfo or "(absent)",
+                "frame_ancestors": "(absent)",
+            })
+        elif xfo_safe and not frame_ancestors:
+            log("warn", f"Clickjacking LOW — X-Frame-Options: {xfo} present but no CSP frame-ancestors")
+            cj_findings.append({
+                "type":            "clickjacking_xfo_only",
+                "severity":        "LOW",
+                "detail":          f"X-Frame-Options: {xfo} set but CSP frame-ancestors absent — XFO is deprecated and ignored by some browsers",
+                "xfo":             xfo,
+                "frame_ancestors": "(absent)",
+            })
+        elif "*" in frame_ancestors:
+            log("crit", f"Clickjacking HIGH — CSP frame-ancestors: {frame_ancestors}")
+            cj_findings.append({
+                "type":            "clickjacking_wildcard_ancestors",
+                "severity":        "HIGH",
+                "detail":          f"CSP frame-ancestors is '{frame_ancestors}' — any origin can frame this page",
+                "xfo":             xfo or "(absent)",
+                "frame_ancestors": frame_ancestors,
+            })
+        else:
+            log("good", f"Clickjacking protected — XFO: {xfo or '(absent)'}, frame-ancestors: {frame_ancestors or '(absent)'}")
+
+    return cj_findings
+
+
+# ── Stage 16: Nuclei ──────────────────────────────────────────────────────────
+def run_nuclei(target, deep=False):
+    log("info", "Running nuclei...")
+    nuclei_findings = []
+
+    which, _ = run("command -v nuclei 2>/dev/null")
+    if not which.strip():
+        log("warn", "nuclei not found — skipping (install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest)")
+        return nuclei_findings
+
+    out_file = "/tmp/nuclei_results.jsonl"
+    try:
+        os.remove(out_file)
+    except FileNotFoundError:
+        pass
+
+    templates = "exposures/,misconfiguration/"
+    if deep:
+        templates += ",cves/,vulnerabilities/"
+
+    cmd = (
+        f"nuclei -u {target} "
+        f"-t {templates} "
+        f"-severity critical,high,medium "
+        f"-silent -jsonl "
+        f"-o {out_file} "
+        f"2>/dev/null"
+    )
+
+    log("info", f"Nuclei templates: {templates}")
+    run(cmd, timeout=300)
+
+    try:
+        with open(out_file) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item     = json.loads(line)
+                    severity = item.get("info", {}).get("severity", "info").upper()
+                    name     = item.get("info", {}).get("name", "?")
+                    tid      = item.get("template-id", "?")
+                    matched  = item.get("matched-at", target)
+                    desc     = item.get("info", {}).get("description", "")
+                    log("crit" if severity == "CRITICAL" else "warn" if severity == "HIGH" else "info",
+                        f"Nuclei [{severity}] {name} — {matched}")
+                    nuclei_findings.append({
+                        "type":        "nuclei_" + tid,
+                        "severity":    severity,
+                        "name":        name,
+                        "template_id": tid,
+                        "matched_at":  matched,
+                        "detail":      desc[:200] if desc else name,
+                    })
+                except json.JSONDecodeError:
+                    continue
+    except FileNotFoundError:
+        log("info", "No nuclei findings")
+
+    crits = [f for f in nuclei_findings if f["severity"] == "CRITICAL"]
+    highs = [f for f in nuclei_findings if f["severity"] == "HIGH"]
+    log("good", f"Nuclei complete — {len(crits)} CRITICAL, {len(highs)} HIGH, {len(nuclei_findings)} total")
+    return nuclei_findings
+
+
 # ── Stage 6: Report Generation ────────────────────────────────────────────────
 def generate_report(target, waf, reflected, js_findings, xss_findings, firebase_findings,
                     secret_findings, cors_findings, redirect_findings, storage_findings,
-                    csp_findings, jsonp_findings, graphql_findings, output_file):
+                    csp_findings, jsonp_findings, graphql_findings,
+                    clickjacking_findings, nuclei_findings, output_file):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     total = len(xss_findings) + len([f for f in js_findings if f["severity"] == "HIGH"])
 
@@ -1188,9 +1310,34 @@ def generate_report(target, waf, reflected, js_findings, xss_findings, firebase_
     else:
         lines.append("No GraphQL introspection endpoint found or introspection disabled.")
 
+    # Section 12 — Clickjacking
+    lines += ["", "---", "", "## 12. Clickjacking", ""]
+    if clickjacking_findings:
+        for c in clickjacking_findings:
+            lines += [
+                f"**Severity:** {c['severity']}  ",
+                f"**Detail:** {c['detail']}  ",
+                f"**X-Frame-Options:** `{c['xfo']}`  ",
+                f"**CSP frame-ancestors:** `{c['frame_ancestors']}`  ",
+                "",
+            ]
+    else:
+        lines.append("Clickjacking protection present and correctly configured.")
+
+    # Section 13 — Nuclei
+    lines += ["", "---", "", "## 13. Nuclei", ""]
+    if nuclei_findings:
+        lines.append("| Severity | Template | Finding | Matched At |")
+        lines.append("|---|---|---|---|")
+        for n in nuclei_findings:
+            lines.append(f"| {n['severity']} | `{n['template_id']}` | {n['name']} | `{n['matched_at'][:60]}` |")
+        lines.append("")
+    else:
+        lines.append("No findings from nuclei (exposures + misconfiguration templates).")
+
     lines += [
         "", "---", "",
-        "## 12. Next Steps",
+        "## 14. Next Steps",
         "",
         "1. **Manually trace** each HIGH-severity sink to its data source",
         "2. **Test DOM sinks** with context-specific payloads from the XSS methodology PDF",
@@ -1295,6 +1442,12 @@ def main():
     # Stage 14 — GraphQL introspection
     graphql_findings = check_graphql(target)
 
+    # Stage 15 — Clickjacking
+    clickjacking_findings = check_clickjacking(target)
+
+    # Stage 16 — Nuclei
+    nuclei_findings = run_nuclei(target, deep=args.deep)
+
     # Stage 6 — Report
     elapsed = round(time.time() - start, 1)
     log("good", f"Scan complete in {elapsed}s")
@@ -1305,6 +1458,8 @@ def main():
     fb_highs       = [f for f in firebase_findings if f["severity"] == "HIGH"]
     sec_crits      = [f for f in secret_findings if f["severity"] == "CRITICAL"]
     cors_crits     = [f for f in cors_findings if f["severity"] == "CRITICAL"]
+    nuc_crits      = [f for f in nuclei_findings if f["severity"] == "CRITICAL"]
+    nuc_highs      = [f for f in nuclei_findings if f["severity"] == "HIGH"]
     print(f"{BO}{'='*60}{RE}")
     print(f"  {R}XSS Confirmed:   {len(confirmed)} (browser-verified){RE}")
     print(f"  {Y}XSS PoC:         {len(unverified)} (needs manual verify){RE}")
@@ -1317,6 +1472,8 @@ def main():
     print(f"  {Y}CSP Issues:      {len(csp_findings)}{RE}")
     print(f"  {Y}JSONP Endpoints: {len(jsonp_findings)}{RE}")
     print(f"  {Y}GraphQL:         {len(graphql_findings)}{RE}")
+    print(f"  {Y}Clickjacking:    {len(clickjacking_findings)}{RE}")
+    print(f"  {R}Nuclei:          {len(nuclei_findings)} ({len(nuc_crits)} CRIT / {len(nuc_highs)} HIGH){RE}")
     print(f"  {R}Firebase Crit:   {len(fb_crits)}{RE}")
     print(f"  {Y}Firebase High:   {len(fb_highs)}{RE}")
     print(f"  {B}WAF:             {waf.upper()}{RE}")
@@ -1326,7 +1483,8 @@ def main():
     generate_report(
         target, waf, reflected, js_findings, xss_findings, firebase_findings,
         secret_findings, cors_findings, redirect_findings, storage_findings,
-        csp_findings, jsonp_findings, graphql_findings, report_file
+        csp_findings, jsonp_findings, graphql_findings,
+        clickjacking_findings, nuclei_findings, report_file
     )
 
 
