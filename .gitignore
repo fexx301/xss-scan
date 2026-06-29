@@ -1,0 +1,18 @@
+# Scan output
+xss_report_*.md
+*.md
+!README.md
+
+# Temp files the scanner writes
+/tmp/xss_*
+/tmp/dalfox_*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
