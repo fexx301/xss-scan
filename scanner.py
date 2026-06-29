@@ -336,6 +336,13 @@ def fuzz_with_dalfox(target, waf, oob=None, reflected=None):
     with open(custom_payload_file, "w") as f:
         f.write("\n".join(all_payloads))
 
+    # Clean up leftover results from previous scans
+    for tmp in ["/tmp/dalfox_results.txt", "/tmp/xss_urls.txt"]:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+
     # Build dalfox command
     oob_flag = f"--blind {oob}" if oob else ""
     dalfox_base = (
